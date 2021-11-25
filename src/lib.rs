@@ -195,7 +195,7 @@ impl Notification {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(untagged)]
-pub enum IncomingMessage {
+pub enum Message {
     Request(Request),
     Notification(Notification),
     Response(Response),
@@ -226,14 +226,12 @@ impl LspTcpDecoder {
         Default::default()
     }
 
-    pub fn consume_body(
-        &mut self,
-        src: &mut BytesMut,
-    ) -> Result<Option<IncomingMessage>, std::io::Error> {
+    pub fn consume_body(&mut self, src: &mut BytesMut) -> Result<Option<Message>, std::io::Error> {
         let ret = Ok(Some(
             serde_json::from_slice(&src[..self.content_length])
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
         ));
+        tracing::trace!("decode {:?}", ret);
         src.advance(self.content_length);
         self.header_consumed = false;
         self.content_length = 0;
@@ -242,48 +240,49 @@ impl LspTcpDecoder {
 }
 
 impl Decoder for LspTcpDecoder {
-    type Item = IncomingMessage;
+    type Item = Message;
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if !src.windows(4).any(|s| s == [b'\r', b'\n', b'\r', b'\n']) {
-            Ok(None)
-        } else if self.header_consumed {
-            tracing::trace!("expect {} bytes got {}", self.content_length, src.len());
-            if self.content_length >= src.len() {
+        if self.header_consumed {
+            if self.content_length > src.len() {
                 Ok(None)
             } else {
                 self.consume_body(src)
             }
         } else {
-            let stop_at = src
-                .windows(4)
-                .position(|s| s == [b'\r', b'\n', b'\r', b'\n'])
-                .unwrap();
-            let headers = String::from_utf8(src[..stop_at].to_vec()).unwrap();
-            for header in headers.split("\r\n") {
-                let mut segs = header.split(":");
-                let key = segs.next().unwrap();
-                if key == "Content-Length" {
-                    self.content_length = segs.next().unwrap().trim().parse().unwrap();
-                } else if key == "Content-Type" {
-                    self.content_type = segs.next().unwrap().trim().to_string();
-                } else {
-                    tracing::error!("unknown header {}", key);
-                }
-            }
-            if self.content_length == 0 {
-                let msg = "empty content length or missing Content-Length header";
-                tracing::error!(msg);
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
-            }
-            self.header_consumed = true;
-            src.advance(stop_at + 4);
-            if self.content_length <= src.len() {
-                self.consume_body(src)
-            } else {
-                src.reserve(self.content_length);
+            if !src.windows(4).any(|s| s == [b'\r', b'\n', b'\r', b'\n']) {
                 Ok(None)
+            } else {
+                let stop_at = src
+                    .windows(4)
+                    .position(|s| s == [b'\r', b'\n', b'\r', b'\n'])
+                    .unwrap();
+                let headers = String::from_utf8(src[..stop_at].to_vec()).unwrap();
+                for header in headers.split("\r\n") {
+                    let mut segs = header.split(":");
+                    let key = segs.next().unwrap();
+                    if key == "Content-Length" {
+                        self.content_length = segs.next().unwrap().trim().parse().unwrap();
+                    } else if key == "Content-Type" {
+                        self.content_type = segs.next().unwrap().trim().to_string();
+                    } else {
+                        tracing::error!("unknown header {}", key);
+                    }
+                }
+                if self.content_length == 0 {
+                    let msg = "empty content length or missing Content-Length header";
+                    tracing::error!(msg);
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+                }
+                self.header_consumed = true;
+                src.advance(stop_at + 4);
+                if self.content_length <= src.len() {
+                    self.consume_body(src)
+                } else {
+                    src.reserve(self.content_length);
+                    Ok(None)
+                }
             }
         }
     }
@@ -294,21 +293,25 @@ pub struct LspTcpEncoder {
     pub content_type: Option<String>,
 }
 
-impl Encoder<Vec<u8>> for LspTcpEncoder {
+impl Encoder<Message> for LspTcpEncoder {
     type Error = std::io::Error;
 
-    fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        tracing::trace!("encode {:?}", item);
+        let json_str = serde_json::to_string(&item)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let json_bytes = json_str.as_bytes();
         let ret = if let Some(ct) = self.content_type.as_ref() {
             dst.write_str(&format!(
                 "Content-Length: {}\r\nContent-Type: {}\r\n\r\n",
-                item.len(),
+                json_bytes.len(),
                 ct
             ))
         } else {
-            dst.write_str(&format!("Content-Length: {}\r\n\r\n", item.len()))
+            dst.write_str(&format!("Content-Length: {}\r\n\r\n", json_bytes.len()))
         };
         ret.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        dst.extend_from_slice(&item);
+        dst.extend_from_slice(&json_bytes);
         Ok(())
     }
 }
@@ -318,16 +321,16 @@ pub struct LspTcpCodec {
     pub encoder: LspTcpEncoder,
     pub decoder: LspTcpDecoder,
 }
-impl Encoder<Vec<u8>> for LspTcpCodec {
+impl Encoder<Message> for LspTcpCodec {
     type Error = std::io::Error;
 
-    fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         self.encoder.encode(item, dst)
     }
 }
 
 impl Decoder for LspTcpCodec {
-    type Item = IncomingMessage;
+    type Item = Message;
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -337,37 +340,31 @@ impl Decoder for LspTcpCodec {
 
 #[async_trait]
 pub trait LspServer {
-    type I: From<Vec<u8>> + Send;
     type T: AsyncWrite + AsyncRead + Unpin + Send;
-    type U: Encoder<Self::I, Error = std::io::Error>
-        + Decoder<Item = IncomingMessage, Error = std::io::Error>
+    type U: Encoder<Message, Error = std::io::Error>
+        + Decoder<Item = Message, Error = std::io::Error>
         + Send;
 
     fn get_framed(&mut self) -> &mut Framed<Self::T, Self::U>;
 
     async fn run(&mut self) -> std::io::Result<()>;
 
-    async fn dispatch_message(&mut self, msg: IncomingMessage) -> std::io::Result<Vec<u8>> {
+    async fn dispatch_message(&mut self, msg: Message) -> std::io::Result<()> {
         match msg {
-            IncomingMessage::Request(req) => self.handle_request(req).await,
-            IncomingMessage::Notification(notify) => self.handle_notification(notify).await,
+            Message::Request(req) => {
+                let resp = self.handle_request(req).await?;
+                self.get_framed().send(resp).await
+            }
+            Message::Notification(notify) => self.handle_notification(notify).await,
             _ => unreachable!(),
         }
     }
-    async fn handle_request(&mut self, req: Request) -> std::io::Result<Vec<u8>>;
-    async fn handle_notification(&mut self, notify: Notification) -> std::io::Result<Vec<u8>>;
+    async fn handle_request(&mut self, req: Request) -> std::io::Result<Message>;
+    async fn handle_notification(&mut self, notify: Notification) -> std::io::Result<()>;
 
     async fn send_notification(&mut self, notify: Notification) -> std::io::Result<()> {
         let framed = self.get_framed();
-        framed
-            .send(
-                serde_json::to_string(&notify)
-                    .unwrap()
-                    .as_bytes()
-                    .to_vec()
-                    .into(),
-            )
-            .await?;
+        framed.send(Message::Notification(notify)).await?;
         Ok(())
     }
 }

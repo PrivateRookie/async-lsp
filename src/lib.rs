@@ -6,6 +6,7 @@ use futures::SinkExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Decoder, Encoder, Framed};
+use ws_tool::frame::{Frame, OpCode};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
@@ -338,6 +339,76 @@ impl Decoder for LspTcpCodec {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LspWsDecoder {
+    pub ws_decoder: ws_tool::codec::FrameDecoder,
+}
+
+impl Decoder for LspWsDecoder {
+    type Item = Message;
+
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if let Some(frame) = self.ws_decoder.decode(src)? {
+            if frame.opcode() != OpCode::Text {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "client send close",
+                ));
+            }
+            Ok(Some(
+                serde_json::from_slice(&frame.payload_data_unmask())
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LspWsEncoder {
+    pub ws_encoder: ws_tool::codec::FrameEncoder,
+}
+
+impl Encoder<Message> for LspWsEncoder {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let mut frame = Frame::new_with_opcode(OpCode::Text);
+        frame.set_mask(false);
+        let json_str = serde_json::to_string(&item).unwrap();
+        frame.set_payload(json_str.as_bytes());
+        self.ws_encoder.encode(frame, dst)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LspWsCodec {
+    pub encoder: LspWsEncoder,
+    pub decoder: LspWsDecoder,
+}
+
+impl Encoder<Message> for LspWsCodec {
+    type Error = std::io::Error;
+
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        self.encoder.encode(item, dst)
+    }
+}
+
+impl Decoder for LspWsCodec {
+    type Item = Message;
+
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        self.decoder.decode(src)
+    }
+}
+
 #[async_trait]
 pub trait LspServer {
     type T: AsyncWrite + AsyncRead + Unpin + Send;
@@ -356,7 +427,10 @@ pub trait LspServer {
                 self.get_framed().send(resp).await
             }
             Message::Notification(notify) => self.handle_notification(notify).await,
-            _ => unreachable!(),
+            _ => {
+                tracing::error!("response from client {:?}", msg);
+                Ok(())
+            }
         }
     }
     async fn handle_request(&mut self, req: Request) -> std::io::Result<Message>;

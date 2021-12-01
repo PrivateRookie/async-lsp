@@ -397,7 +397,7 @@ impl Encoder<Message> for LspWsEncoder {
 }
 
 pub fn default_lsp_codec_factory(
-    _req: http::Result<()>,
+    _req: http::Request<()>,
     stream: WsStream,
 ) -> Result<Framed<WsStream, LspWsCodec>, ws_tool::errors::WsError> {
     let mut codec = WebSocketBytesCodec::default();

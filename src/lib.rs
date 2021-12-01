@@ -347,13 +347,11 @@ pub struct LspWsDecoder {
 fn decode<D: Decoder<Item = (OpCode, BytesMut), Error = ws_tool::errors::WsError>>(
     decoder: &mut D,
     src: &mut BytesMut,
-) -> Result<Option<Message>, std::io::Error> {
+) -> Result<Option<Message>, ws_tool::errors::WsError> {
     if let Some((code, data)) = decoder.decode(src).unwrap() {
         if code != OpCode::Text {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "client send close",
-            ));
+            // TODO cast to correct error
+            return Err(ws_tool::errors::WsError::InvalidUri("".to_string()));
         }
         let msg = serde_json::from_slice(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -366,7 +364,7 @@ fn decode<D: Decoder<Item = (OpCode, BytesMut), Error = ws_tool::errors::WsError
 impl Decoder for LspWsDecoder {
     type Item = Message;
 
-    type Error = std::io::Error;
+    type Error = ws_tool::errors::WsError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         decode(&mut self.ws_decoder, src)
@@ -386,7 +384,7 @@ pub struct LspWsEncoder {
 }
 
 impl Encoder<Message> for LspWsEncoder {
-    type Error = std::io::Error;
+    type Error = ws_tool::errors::WsError;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         self.ws_encoder
@@ -411,7 +409,7 @@ pub struct LspWsCodec {
 }
 
 impl Encoder<Message> for LspWsCodec {
-    type Error = std::io::Error;
+    type Error = ws_tool::errors::WsError;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
         self.codec.encode((OpCode::Text, item.into()), dst).unwrap();
@@ -422,7 +420,7 @@ impl Encoder<Message> for LspWsCodec {
 impl Decoder for LspWsCodec {
     type Item = Message;
 
-    type Error = std::io::Error;
+    type Error = ws_tool::errors::WsError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         decode(&mut self.codec, src)
@@ -432,15 +430,14 @@ impl Decoder for LspWsCodec {
 #[async_trait]
 pub trait LspServer {
     type T: AsyncWrite + AsyncRead + Unpin + Send;
-    type U: Encoder<Message, Error = std::io::Error>
-        + Decoder<Item = Message, Error = std::io::Error>
-        + Send;
+    type U: Encoder<Message, Error = Self::E> + Decoder<Item = Message, Error = Self::E> + Send;
+    type E: From<std::io::Error>;
 
     fn get_framed(&mut self) -> &mut Framed<Self::T, Self::U>;
 
-    async fn run(&mut self) -> std::io::Result<()>;
+    async fn run(&mut self) -> Result<(), Self::E>;
 
-    async fn dispatch_message(&mut self, msg: Message) -> std::io::Result<()> {
+    async fn dispatch_message(&mut self, msg: Message) -> Result<(), Self::E> {
         match msg {
             Message::Request(req) => {
                 let resp = self.handle_request(req).await?;
@@ -453,10 +450,10 @@ pub trait LspServer {
             }
         }
     }
-    async fn handle_request(&mut self, req: Request) -> std::io::Result<Message>;
-    async fn handle_notification(&mut self, notify: Notification) -> std::io::Result<()>;
+    async fn handle_request(&mut self, req: Request) -> Result<Message, Self::E>;
+    async fn handle_notification(&mut self, notify: Notification) -> Result<(), Self::E>;
 
-    async fn send_notification(&mut self, notify: Notification) -> std::io::Result<()> {
+    async fn send_notification(&mut self, notify: Notification) -> Result<(), Self::E> {
         let framed = self.get_framed();
         framed.send(Message::Notification(notify)).await?;
         Ok(())

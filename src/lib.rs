@@ -1,7 +1,7 @@
-use std::fmt::{self, Error, Write};
+use std::fmt::{self, Write};
 
 use async_trait::async_trait;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BytesMut};
 use futures::SinkExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};

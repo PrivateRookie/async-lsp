@@ -1,12 +1,12 @@
-use std::fmt::{self, Write};
+use std::fmt::{self, Error, Write};
 
 use async_trait::async_trait;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::SinkExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Decoder, Encoder, Framed};
-use ws_tool::frame::OpCode;
+use ws_tool::{codec::WebSocketBytesCodec, frame::OpCode, stream::WsStream};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
@@ -344,25 +344,39 @@ pub struct LspWsDecoder {
     pub ws_decoder: ws_tool::codec::WebSocketBytesDecoder,
 }
 
+fn decode<D: Decoder<Item = (OpCode, BytesMut), Error = ws_tool::errors::WsError>>(
+    decoder: &mut D,
+    src: &mut BytesMut,
+) -> Result<Option<Message>, std::io::Error> {
+    if let Some((code, data)) = decoder.decode(src).unwrap() {
+        if code != OpCode::Text {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "client send close",
+            ));
+        }
+        let msg = serde_json::from_slice(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some(msg))
+    } else {
+        Ok(None)
+    }
+}
+
 impl Decoder for LspWsDecoder {
     type Item = Message;
 
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if let Some((code, data)) = self.ws_decoder.decode(src).unwrap() {
-            if code != OpCode::Text {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    "client send close",
-                ));
-            }
-            let msg = serde_json::from_slice(&data)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            Ok(Some(msg))
-        } else {
-            Ok(None)
-        }
+        decode(&mut self.ws_decoder, src)
+    }
+}
+
+impl From<Message> for BytesMut {
+    fn from(m: Message) -> Self {
+        let b = serde_json::to_vec(&m).unwrap();
+        BytesMut::from_iter(b)
     }
 }
 
@@ -375,24 +389,33 @@ impl Encoder<Message> for LspWsEncoder {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let b = serde_json::to_vec(&item).unwrap();
-        let data = BytesMut::from_iter(b);
-        self.ws_encoder.encode((OpCode::Text, data), dst).unwrap();
+        self.ws_encoder
+            .encode((OpCode::Text, item.into()), dst)
+            .unwrap();
         Ok(())
     }
 }
 
+pub fn default_lsp_codec_factory(
+    _req: http::Result<()>,
+    stream: WsStream,
+) -> Result<Framed<WsStream, LspWsCodec>, ws_tool::errors::WsError> {
+    let mut codec = WebSocketBytesCodec::default();
+    codec.frame_codec.config.mask = false;
+    Ok(Framed::new(stream, LspWsCodec { codec }))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LspWsCodec {
-    pub encoder: LspWsEncoder,
-    pub decoder: LspWsDecoder,
+    pub codec: ws_tool::codec::WebSocketBytesCodec,
 }
 
 impl Encoder<Message> for LspWsCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        self.encoder.encode(item, dst)
+        self.codec.encode((OpCode::Text, item.into()), dst).unwrap();
+        Ok(())
     }
 }
 
@@ -402,7 +425,7 @@ impl Decoder for LspWsCodec {
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        self.decoder.decode(src)
+        decode(&mut self.codec, src)
     }
 }
 

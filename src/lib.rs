@@ -6,7 +6,7 @@ use futures::SinkExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Decoder, Encoder, Framed};
-use ws_tool::frame::{Frame, OpCode};
+use ws_tool::frame::OpCode;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
@@ -341,7 +341,7 @@ impl Decoder for LspTcpCodec {
 
 #[derive(Debug, Clone, Default)]
 pub struct LspWsDecoder {
-    pub ws_decoder: ws_tool::codec::FrameDecoder,
+    pub ws_decoder: ws_tool::codec::WebSocketBytesDecoder,
 }
 
 impl Decoder for LspWsDecoder {
@@ -350,17 +350,16 @@ impl Decoder for LspWsDecoder {
     type Error = std::io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if let Some(frame) = self.ws_decoder.decode(src)? {
-            if frame.opcode() != OpCode::Text {
+        if let Some((code, data)) = self.ws_decoder.decode(src).unwrap() {
+            if code != OpCode::Text {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionAborted,
                     "client send close",
                 ));
             }
-            Ok(Some(
-                serde_json::from_slice(&frame.payload_data_unmask())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-            ))
+            let msg = serde_json::from_slice(&data)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            Ok(Some(msg))
         } else {
             Ok(None)
         }
@@ -369,18 +368,16 @@ impl Decoder for LspWsDecoder {
 
 #[derive(Debug, Clone, Default)]
 pub struct LspWsEncoder {
-    pub ws_encoder: ws_tool::codec::FrameEncoder,
+    pub ws_encoder: ws_tool::codec::WebSocketBytesEncoder,
 }
 
 impl Encoder<Message> for LspWsEncoder {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let mut frame = Frame::new_with_opcode(OpCode::Text);
-        frame.set_mask(false);
-        let json_str = serde_json::to_string(&item).unwrap();
-        frame.set_payload(json_str.as_bytes());
-        self.ws_encoder.encode(frame, dst)?;
+        let b = serde_json::to_vec(&item).unwrap();
+        let data = BytesMut::from_iter(b);
+        self.ws_encoder.encode((OpCode::Text, data), dst).unwrap();
         Ok(())
     }
 }
